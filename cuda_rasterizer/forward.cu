@@ -8,12 +8,14 @@
  *
  * For inquiries contact  george.drettakis@inria.fr
  */
-
+#include <cuda.h>
 #include "forward.h"
 #include "auxiliary.h"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <cuda_runtime.h>
 namespace cg = cooperative_groups;
+
 
 // Forward method for converting the input spherical harmonics
 // coefficients of each Gaussian to a simple RGB color.
@@ -169,6 +171,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float2* points_xy_image,
 	float* depths,
 	float* cov3Ds,
+	float3* cov2Ds,
 	float* rgb,
 	float4* conic_opacity,
 	const dim3 grid,
@@ -211,6 +214,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// Compute 2D screen-space covariance matrix
 	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
+	cov2Ds[idx] = cov;
 
 	constexpr float h_var = 0.3f;
 	const float det_cov = cov.x * cov.z - cov.y * cov.y;
@@ -286,9 +290,10 @@ renderCUDA(
 	float* __restrict__ out_color,
 	const float* __restrict__ depths,
 	float* __restrict__ invdepth)
-{
+{	
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
+
 	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
 	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
 	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
@@ -411,6 +416,13 @@ void FORWARD::render(
 	float* depths,
 	float* depth)
 {
+	cudaEvent_t start, stop;
+	cudaEventCreate(&start), true;
+	cudaEventCreate(&stop);
+
+	cudaEventRecord(start);
+	cudaEventSynchronize(start);
+
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
 		point_list,
@@ -424,6 +436,14 @@ void FORWARD::render(
 		out_color,
 		depths, 
 		depth);
+
+
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	float elapsedTime;
+	cudaEventElapsedTime(&elapsedTime, start, stop);
+
+	printf("CUDA kernel execution time: %f ms\n", elapsedTime);
 }
 
 void FORWARD::preprocess(int P, int D, int M,
@@ -446,6 +466,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	float2* means2D,
 	float* depths,
 	float* cov3Ds,
+	float3* cov2Ds,
 	float* rgb,
 	float4* conic_opacity,
 	const dim3 grid,
@@ -474,6 +495,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		means2D,
 		depths,
 		cov3Ds,
+		cov2Ds,
 		rgb,
 		conic_opacity,
 		grid,

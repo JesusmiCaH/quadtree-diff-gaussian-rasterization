@@ -30,6 +30,7 @@ namespace cg = cooperative_groups;
 #include "forward.h"
 #include "backward.h"
 
+
 // Helper function to find the next-highest bit of the MSB
 // on the CPU.
 uint32_t getHigherMsb(uint32_t n)
@@ -65,6 +66,194 @@ __global__ void checkFrustum(int P,
 	present[idx] = in_frustum(idx, orig_points, viewmatrix, projmatrix, false, p_view);
 }
 
+
+__device__ bool BoxInsideGaussian(
+	uint2 rect_min, uint2 rect_max,
+	float2 points_xy,
+	float3 cov2D_inv,
+	float confidence,
+)
+{
+	// Transform the rectangle corners relative to the Gaussian center
+	int2 c_rect_min = { rect_min.x - points_xy.x, rect_min.y - points_xy.y };
+	int2 c_rect_max = { rect_max.x - points_xy.x, rect_max.y - points_xy.y };
+
+	// Check each corner of the rectangle
+	float corners[4][2] = {
+		{ c_rect_min.x, c_rect_min.y },
+		{ c_rect_max.x, c_rect_min.y },
+		{ c_rect_min.x, c_rect_max.y },
+		{ c_rect_max.x, c_rect_max.y }
+	};
+
+	uint n_inside = 0;
+
+	for (int i = 0; i < 4; i++) {
+		float x = corners[i][0];
+		float y = corners[i][1];
+
+
+		// Evaluate the ellipse equation: cov2D.x * x^2 + 2 * cov2D.y * x * y + cov2D.z * y^2 <= 1
+		float ellipse_value = cov2D_inv.x * x * x + 2.0f * cov2D_inv.y * x * y + cov2D_inv.z * y * y;
+		// printf("ellipse value is %f\n", ellipse_value);
+		if (ellipse_value < confidence) {
+			n_inside++;
+			if(n_inside>=2) return true;
+		}
+	}
+	// All corners are inside the ellipse
+	return false;
+}
+
+__device__ bool GaussianInsideBox(
+	uint2 rect_min, uint2 rect_max,
+	float2 points_xy)
+{
+	return (points_xy.x >= rect_min.x && points_xy.x < rect_max.x &&
+		points_xy.y >= rect_min.y && points_xy.y < rect_max.y);
+}
+
+__device__ bool GaussianIntersectBox(
+	uint2 rect_min, uint2 rect_max,
+	float2 points_xy,
+	float3 cov2D_inv,
+	float tolerant,
+)
+{
+	float2 c_rect_min = { rect_min.x, rect_min.y };
+	float2 c_rect_max = { rect_max.x, rect_max.y };
+
+	c_rect_max.x -= points_xy.x;
+	c_rect_max.y -= points_xy.y;
+	c_rect_min.x -= points_xy.x;
+	c_rect_min.y -= points_xy.y;
+
+	
+	
+	float delta_n = c_rect_min.y * c_rect_min.y * cov2D_inv.y * cov2D_inv.y - cov2D_inv.x * ( cov2D_inv.z * c_rect_min.y * c_rect_min.y -1);
+	if (delta_n >= 0){
+		float x_min = (- cov2D_inv.y * c_rect_min.y - sqrt(delta_n)) / cov2D_inv.x;
+		float x_max = (- cov2D_inv.y * c_rect_min.y + sqrt(delta_n)) / cov2D_inv.x;
+		if (x_min < c_rect_max.x+tolerant && x_max > c_rect_min.x-tolerant)
+			return true;
+	}
+
+	float delta_s = c_rect_max.y * c_rect_max.y * cov2D_inv.y * cov2D_inv.y - cov2D_inv.x * ( cov2D_inv.z * c_rect_max.y * c_rect_max.y -1);
+	if (delta_s >= 0){
+		float x_min = (- cov2D_inv.y * c_rect_max.y - sqrt(delta_s)) / cov2D_inv.x;
+		float x_max = (- cov2D_inv.y * c_rect_max.y + sqrt(delta_s)) / cov2D_inv.x;
+		if (x_min < c_rect_max.x+tolerant && x_max > c_rect_min.x-tolerant)
+			return true;
+	}
+
+	float delta_w = c_rect_min.x * c_rect_min.x * cov2D_inv.y * cov2D_inv.y - cov2D_inv.z * ( cov2D_inv.x * c_rect_min.x * c_rect_min.x -1);
+	if (delta_w >= 0){
+		float y_min = (- cov2D_inv.y * c_rect_min.x - sqrt(delta_w)) / cov2D_inv.z;
+		float y_max = (- cov2D_inv.y * c_rect_min.x + sqrt(delta_w)) / cov2D_inv.z;
+		if (y_min < c_rect_max.y+tolerant && y_max > c_rect_min.y-tolerant)
+			return true;
+	}
+
+	float delta_e = c_rect_max.x * c_rect_max.x * cov2D_inv.y * cov2D_inv.y - cov2D_inv.z * ( cov2D_inv.x * c_rect_max.x * c_rect_max.x -1);
+	if (delta_e >= 0){
+		float y_min = (- cov2D_inv.y * c_rect_max.x - sqrt(delta_e)) / cov2D_inv.z;
+		float y_max = (- cov2D_inv.y * c_rect_max.x + sqrt(delta_e)) / cov2D_inv.z;
+		if (y_min < c_rect_max.y+tolerant && y_max > c_rect_min.y-tolerant)
+			return true;
+	}
+	
+	return false;
+}
+
+#define MAX_STACK 64
+
+__device__ void kvpairByQuadtree(
+	uint2 rect_min, uint2 rect_max,
+	dim3 grid,
+	uint64_t* gaussian_keys_unsorted,
+	uint32_t* gaussian_values_unsorted,
+	uint32_t offset,
+	uint32_t idx,
+	float2 points_xy,
+	const float* depths,
+	float3 cov2D,
+	float tolerant,
+	float confidence
+)
+{
+	// 模拟栈
+	uint2 stack_min[MAX_STACK];
+	uint2 stack_max[MAX_STACK];
+	int stack_ptr = 0;
+
+	// 初始压入
+	stack_min[stack_ptr] = rect_min;
+	stack_max[stack_ptr] = rect_max;
+	stack_ptr++;
+
+	while (stack_ptr > 0)
+	{
+		stack_ptr--;
+		uint2 cur_min = stack_min[stack_ptr];
+		uint2 cur_max = stack_max[stack_ptr];
+
+		uint2 real_rect_min = {cur_min.x * BLOCK_X, cur_min.y * BLOCK_Y};
+		uint2 real_rect_max = {cur_max.x * BLOCK_X, cur_max.y * BLOCK_Y};
+		// Compute the inverse of the 2D covariance matrix
+		float det = cov2D.x * cov2D.z - cov2D.y * cov2D.y;
+		float3 cov2D_inv = {
+			cov2D.z / det,
+			-cov2D.y / det,
+			cov2D.x / det
+		};
+
+		if (
+			GaussianInsideBox(real_rect_min, real_rect_max, points_xy) ||
+			GaussianIntersectBox(real_rect_min, real_rect_max, points_xy, cov2D_inv, tolerant) ||
+			BoxInsideGaussian(real_rect_min, real_rect_max, points_xy, cov2D_inv, confidence) ||
+			false
+		)
+		{
+			if (cur_max.x - cur_min.x == 0 || cur_max.y - cur_min.y == 0)
+			{
+				continue;
+			}
+			else if (cur_max.x - cur_min.x == 1 && cur_max.y - cur_min.y == 1)
+			{
+				uint64_t key = cur_min.y * grid.x + cur_min.x;
+				key <<= 32;
+				key |= *((uint32_t*)&depths[idx]);
+				gaussian_keys_unsorted[offset] = key;
+				gaussian_values_unsorted[offset] = idx;
+				offset++;
+			}
+			else if (stack_ptr + 4 <= MAX_STACK)
+			{
+				uint2 mid = {
+					(cur_min.x + cur_max.x) / 2,
+					(cur_min.y + cur_max.y) / 2};
+
+				// 四个象限压入栈
+				stack_min[stack_ptr] = cur_min;
+				stack_max[stack_ptr] = mid;
+				stack_ptr++;
+
+				stack_min[stack_ptr] = {mid.x, cur_min.y};
+				stack_max[stack_ptr] = {cur_max.x, mid.y};
+				stack_ptr++;
+
+				stack_min[stack_ptr] = {cur_min.x, mid.y};
+				stack_max[stack_ptr] = {mid.x, cur_max.y};
+				stack_ptr++;
+
+				stack_min[stack_ptr] = mid;
+				stack_max[stack_ptr] = cur_max;
+				stack_ptr++;
+			}
+		}
+	}
+}
+
 // Generates one key/value pair for all Gaussian / tile overlaps. 
 // Run once per Gaussian (1:N mapping).
 __global__ void duplicateWithKeys(
@@ -75,7 +264,10 @@ __global__ void duplicateWithKeys(
 	uint64_t* gaussian_keys_unsorted,
 	uint32_t* gaussian_values_unsorted,
 	int* radii,
-	dim3 grid)
+	float3* cov2Ds,
+	dim3 grid,
+	float tolerant,
+	float confidence)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
@@ -88,27 +280,54 @@ __global__ void duplicateWithKeys(
 		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
 		uint2 rect_min, rect_max;
 
+		uint32_t off_tree = off;
+
 		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
 
+		// printf("idx %lld, offset %d \n", idx, off);
 		// For each tile that the bounding rect overlaps, emit a 
 		// key/value pair. The key is |  tile ID  |      depth      |,
 		// and the value is the ID of the Gaussian. Sorting the values 
 		// with this key yields Gaussian IDs in a list, such that they
 		// are first sorted by tile and then by depth. 
+
 		for (int y = rect_min.y; y < rect_max.y; y++)
 		{
 			for (int x = rect_min.x; x < rect_max.x; x++)
 			{
-				uint64_t key = y * grid.x + x;
-				key <<= 32;
-				key |= *((uint32_t*)&depths[idx]);
-				gaussian_keys_unsorted[off] = key;
-				gaussian_values_unsorted[off] = idx;
-				off++;
+				// uint64_t key = y * grid.x + x;
+				// printf("key is %llu, value is %d\n", key, y * grid.x + x);
+				// key <<= 32;
+				// key |= *((uint32_t*)&depths[idx]);
+				// gaussian_keys_unsorted[off] = key;
+				gaussian_keys_unsorted[off] = 0;
+				// gaussian_values_unsorted[off] = idx;
+				// printf("offset = %d, gaussiankeysunsorted = %lld \n", off, gaussian_keys_unsorted[off]);
+				off++;	
 			}
+
 		}
+
+
+		// Use quadtree to find the tile that the Gaussian intersects
+		// and add the key/value pair to the list.
+		kvpairByQuadtree(
+			rect_min, rect_max,
+			grid,
+			gaussian_keys_unsorted,
+			gaussian_values_unsorted,
+			off_tree,
+			idx,
+			points_xy[idx],
+			depths,
+			cov2Ds[idx],
+			tolerant,
+			confidence,
+		);
+
 	}
 }
+
 
 // Check keys to see if it is at the start/end of one tile's range in 
 // the full sorted list. If yes, write start/end of this tile. 
@@ -116,17 +335,28 @@ __global__ void duplicateWithKeys(
 __global__ void identifyTileRanges(int L, uint64_t* point_list_keys, uint2* ranges)
 {
 	auto idx = cg::this_grid().thread_rank();
-	if (idx >= L)
+
+	if (idx >= L){
 		return;
+	}
 
 	// Read tile ID from key. Update start/end of tile range if at limit.
 	uint64_t key = point_list_keys[idx];
+	if (key==0){
+		return;
+	}
 	uint32_t currtile = key >> 32;
-	if (idx == 0)
-		ranges[currtile].x = 0;
+	uint32_t prevtile = point_list_keys[idx - 1] >> 32;
+
+	// printf("IDX %lld, istrue? %d \n", idx, currtile != prevtile);
+
+	if (idx == 0 || point_list_keys[idx - 1] == 0){
+		ranges[currtile].x = idx;
+	}
 	else
 	{
 		uint32_t prevtile = point_list_keys[idx - 1] >> 32;
+
 		if (currtile != prevtile)
 		{
 			ranges[prevtile].y = idx;
@@ -135,6 +365,7 @@ __global__ void identifyTileRanges(int L, uint64_t* point_list_keys, uint2* rang
 	}
 	if (idx == L - 1)
 		ranges[currtile].y = L;
+	// printf("range = %d, %d\n", ranges[currtile].x, ranges[currtile].y);
 }
 
 // Mark Gaussians as visible/invisible, based on view frustum testing
@@ -219,7 +450,9 @@ int CudaRasterizer::Rasterizer::forward(
 	float* depth,
 	bool antialiasing,
 	int* radii,
-	bool debug)
+	bool debug,
+	float tolerant,
+	float confidence)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -246,6 +479,9 @@ int CudaRasterizer::Rasterizer::forward(
 		throw std::runtime_error("For non-RGB, provide precomputed Gaussian colors!");
 	}
 
+	float3* cov2Ds;
+	CHECK_CUDA(cudaMalloc((void**)&cov2Ds, P * sizeof(float3)), debug);
+
 	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
 	CHECK_CUDA(FORWARD::preprocess(
 		P, D, M,
@@ -267,6 +503,7 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.means2D,
 		geomState.depths,
 		geomState.cov3D,
+		cov2Ds,
 		geomState.rgb,
 		geomState.conic_opacity,
 		tile_grid,
@@ -283,12 +520,15 @@ int CudaRasterizer::Rasterizer::forward(
 	int num_rendered;
 	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
 
+	printf("numrenderd %d\n", num_rendered);
+
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
 
 	// For each instance to be rendered, produce adequate [ tile | depth ] key 
 	// and corresponding dublicated Gaussian indices to be sorted
+	
 	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
 		P,
 		geomState.means2D,
@@ -297,8 +537,15 @@ int CudaRasterizer::Rasterizer::forward(
 		binningState.point_list_keys_unsorted,
 		binningState.point_list_unsorted,
 		radii,
-		tile_grid)
-	CHECK_CUDA(, debug)
+		cov2Ds,
+		tile_grid,
+		tolerant,
+
+	);
+	
+	cudaDeviceSynchronize();
+
+	CHECK_CUDA(cudaGetLastError(), debug)
 
 	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
 
@@ -309,8 +556,16 @@ int CudaRasterizer::Rasterizer::forward(
 		binningState.point_list_keys_unsorted, binningState.point_list_keys,
 		binningState.point_list_unsorted, binningState.point_list,
 		num_rendered, 0, 32 + bit), debug)
-
+	
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
+
+	// // Debugging: Check all the values inside binningState.point_list_keys
+	// std::vector<uint64_t> h_point_list_keys(num_rendered);
+	// cudaMemcpy(h_point_list_keys.data(), binningState.point_list_keys, num_rendered * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+
+	// for (int i = 0; i < num_rendered; ++i) {
+	// 	printf("point_list_keys[%d] = %llu\n", i, h_point_list_keys[i]>>32);
+	// }
 
 	// Identify start and end of per-tile workloads in sorted list
 	if (num_rendered > 0)
@@ -319,6 +574,15 @@ int CudaRasterizer::Rasterizer::forward(
 			binningState.point_list_keys,
 			imgState.ranges);
 	CHECK_CUDA(, debug)
+
+	// Debugging: Check the imgState.ranges
+	std::vector<uint2> h_ranges(tile_grid.x * tile_grid.y);
+	cudaMemcpy(h_ranges.data(), imgState.ranges, tile_grid.x * tile_grid.y * sizeof(uint2), cudaMemcpyDeviceToHost);
+
+	for (int i = 0; i < tile_grid.x * tile_grid.y; ++i) {
+		printf("不应如是");
+		printf("Tile %d: range start = %u, range end = %u\n", i, h_ranges[i].x, h_ranges[i].y);
+	}
 
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;

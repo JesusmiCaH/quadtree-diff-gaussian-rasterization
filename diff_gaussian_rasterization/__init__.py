@@ -55,7 +55,8 @@ class _RasterizeGaussians(torch.autograd.Function):
         cov3Ds_precomp,
         raster_settings,
     ):
-
+        tolerant = 4.0
+        confidence = 3.0
         # Restructure arguments the way that the C++ lib expects them
         args = (
             raster_settings.bg, 
@@ -77,7 +78,9 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.campos,
             raster_settings.prefiltered,
             raster_settings.antialiasing,
-            raster_settings.debug
+            raster_settings.debug,
+            tolerant,
+            confidence,
         )
 
         # Invoke C++/CUDA rasterizer
